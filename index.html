@@ -302,8 +302,24 @@ function seed(){
     projects:[]
   };
 }
-function save(){ try{localStorage.setItem('pmBigTable',JSON.stringify(db));}catch(e){} cloudAutoSave(); }
+function save(){ try{localStorage.setItem('pmBigTable',JSON.stringify(db));}catch(e){} _localDirty=true; cloudAutoSave(); }
 function load(){ try{return JSON.parse(localStorage.getItem('pmBigTable'));}catch(e){return null;} }
+// 防覆蓋：記錄「最後成功推上雲端的內容」。本機若有尚未推上去的變更，載入時要保護本機、先推上去，而不是被舊雲端蓋掉。
+let _localDirty=false;          // 本機有未同步的變更
+let _lastPushedJSON=null;       // 最後一次成功推上雲端的內容快照
+let _lastSnapAt=0;              // 上次存「時間戳快照」的時間
+const SNAP_KEEP=30;             // 保留最近幾份快照
+const SNAP_MIN_GAP=5*60*1000;  // 兩次快照最少間隔（5 分鐘）
+// 簡單字串雜湊（用來判斷本機內容是否等於最後推上雲端的內容，可跨重新整理保存）
+function hashStr(s){ let h=0; for(let i=0;i<s.length;i++){ h=(h*31+s.charCodeAt(i))|0; } return String(h); }
+// 開機時判斷本機是否有「尚未推上雲端」的變更：本機內容的雜湊 ≠ 上次推上去的雜湊
+function detectBootDirty(){
+  try{
+    const pushed=localStorage.getItem('pmPushedHash');
+    const cur=hashStr(JSON.stringify(db));
+    _localDirty = !pushed || pushed!==cur;
+  }catch(e){ _localDirty=false; }
+}
 
 /* ============ GOOGLE DRIVE 同步 ============ */
 const GOOGLE_CLIENT_ID='223765971288-dmqpj1spcq91jj91j29b4oofuf4lervh.apps.googleusercontent.com';
@@ -401,7 +417,7 @@ async function ensureSharedFile(){
   return null; // 員工且共用檔還沒建立
 }
 
-// 從雲端讀取共用資料覆蓋本機。silent=true 時用於背景自動同步（不打擾、不在編輯中重繪）
+// 從雲端讀取共用資料。重點：若本機有「尚未推上雲端的變更」，絕不被舊雲端覆蓋——改成先把本機推上去。
 async function cloudPull(silent){
   try{
     const id=await ensureSharedFile();
@@ -410,13 +426,24 @@ async function cloudPull(silent){
     let data=res.result;
     if(typeof data==='string'){try{data=JSON.parse(data);}catch(e){data=null;}}
     if(data&&data.members&&data.projects){
-      // 背景自動同步時：若使用者正在編輯（modal 開著），先不要覆蓋，等下次
+      const incoming=JSON.stringify(data);
+      const localJSON=JSON.stringify(db);
+      // 內容相同→不動作
+      if(incoming===localJSON){ if(silent)setCloudStatus('已是最新 '+new Date().toLocaleTimeString()); return; }
+      // ★防覆蓋核心：本機有未同步變更，且雲端不等於「我最後推上去的版本」
+      //   代表兩邊都動過或本機較新 → 不可用雲端蓋本機，改為保護本機、把本機推上去。
+      if(_localDirty && incoming!==_lastPushedJSON){
+        if(!silent)toast('偵測到本機有未上傳的變更，已保護本機資料並上傳，未被雲端覆蓋');
+        await cloudPush();
+        return;
+      }
+      // 背景自動同步時：使用者正在編輯（modal 開著）先不要覆蓋，等下次
       const modalOpen=document.getElementById('modal')&&document.getElementById('modal').classList.contains('open');
       if(silent&&modalOpen)return;
-      // 若內容跟現在一樣就不重繪，避免畫面跳動
-      const incoming=JSON.stringify(data);
-      if(silent&&incoming===JSON.stringify(db))return;
+      // 安全：本機沒有未同步變更 → 採用雲端較新的版本
       db=data; localStorage.setItem('pmBigTable',JSON.stringify(db));
+      _lastPushedJSON=incoming; _localDirty=false;
+      try{localStorage.setItem('pmPushedHash',hashStr(incoming));}catch(e){}
       migrate();
       renderDashboard();renderMembers();
       if(currentView())switchView(currentView());
@@ -429,20 +456,66 @@ async function cloudPull(silent){
   }catch(e){ if(!silent)toast('讀取雲端失敗：'+(e&&e.message?e.message:JSON.stringify(e))); }
 }
 
-// 寫入共用檔
-async function cloudPush(){
+// 寫入共用檔，並（必要時）另存一份時間戳快照備份，永不覆蓋舊快照。
+async function cloudPush(opts){
   if(!gAuth.token)return;
   try{
     const id=await ensureSharedFile();
     if(!id)return;
+    const payload=JSON.stringify(db);
     await gapi.client.request({
       path:'/upload/drive/v3/files/'+id, method:'PATCH',
       params:{uploadType:'media'},
       headers:{'Content-Type':'application/json'},
-      body:JSON.stringify(db)});
+      body:payload});
+    _lastPushedJSON=payload; _localDirty=false;
+    try{localStorage.setItem('pmPushedHash',hashStr(payload));}catch(e){}
     setCloudStatus('已同步 '+new Date().toLocaleTimeString());
     cloudSaveTimer=null;
+    // 視情況另存時間戳快照（節流：至少間隔 SNAP_MIN_GAP，或明確要求）
+    if((opts&&opts.snapshot) || Date.now()-_lastSnapAt>=SNAP_MIN_GAP){
+      _lastSnapAt=Date.now();
+      saveSnapshot(payload).catch(()=>{});
+    }
   }catch(e){setCloudStatus('同步失敗');}
+}
+
+// 另存一份帶時間戳的快照檔（pmdata-snap-YYYYMMDD-HHMM.json），保留最近 SNAP_KEEP 份。
+async function saveSnapshot(payload){
+  if(!gAuth.token)return;
+  try{
+    const d=new Date();
+    const pad=n=>String(n).padStart(2,'0');
+    const stamp=`${d.getFullYear()}${pad(d.getMonth()+1)}${pad(d.getDate())}-${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}`;
+    const name=`pmdata-snap-${stamp}.json`;
+    const meta={name,mimeType:'application/json'};
+    if(SHARED_FOLDER_ID)meta.parents=[SHARED_FOLDER_ID];
+    // 用 multipart 建立含內容的新檔
+    const boundary='-------pmsnap'+Date.now();
+    const body=`--${boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n`+
+      JSON.stringify(meta)+`\r\n--${boundary}\r\nContent-Type: application/json\r\n\r\n`+
+      (payload||JSON.stringify(db))+`\r\n--${boundary}--`;
+    await gapi.client.request({
+      path:'/upload/drive/v3/files', method:'POST',
+      params:{uploadType:'multipart'},
+      headers:{'Content-Type':'multipart/related; boundary='+boundary},
+      body});
+    setCloudStatus('已存快照 '+new Date().toLocaleTimeString());
+    pruneSnapshots().catch(()=>{});
+  }catch(e){/* 快照失敗不影響主檔 */}
+}
+
+// 清理多餘快照，只留最近 SNAP_KEEP 份。
+async function pruneSnapshots(){
+  try{
+    let q=`name contains 'pmdata-snap-' and trashed=false`;
+    if(SHARED_FOLDER_ID)q=`'${SHARED_FOLDER_ID}' in parents and `+q;
+    const res=await gapi.client.drive.files.list({q,fields:'files(id,name,createdTime)',orderBy:'createdTime desc',pageSize:100,spaces:'drive'});
+    const files=(res.result.files||[]);
+    if(files.length<=SNAP_KEEP)return;
+    const toDelete=files.slice(SNAP_KEEP);
+    for(const f of toDelete){ try{ await gapi.client.drive.files.delete({fileId:f.id}); }catch(e){} }
+  }catch(e){}
 }
 function currentView(){const t=document.querySelector('.tab.active');return t?t.dataset.view:'dashboard';}
 
@@ -464,11 +537,20 @@ async function autoPullIfIdle(reason){
   try{ await cloudPull(true); }catch(e){}
 }
 let _autoSyncBound=false;
+let _snapTimer=null;
 function startAutoSync(){
   if(_autoSyncBound)return; // 只綁一次，避免重複監聽
   _autoSyncBound=true;
   document.addEventListener('visibilitychange',()=>{ if(!document.hidden)autoPullIfIdle('visible'); });
   window.addEventListener('focus',()=>autoPullIfIdle('focus'));
+  // 離開頁面 / 重新整理時：盡力存一份快照（瀏覽器給的時間很短，可能來不及，故另有定時墊底）
+  const leaveSnap=()=>{ try{ if(gAuth.token&&_localDirty){ cloudPush({snapshot:true}); } }catch(e){} };
+  window.addEventListener('pagehide',leaveSnap);
+  window.addEventListener('beforeunload',leaveSnap);
+  document.addEventListener('visibilitychange',()=>{ if(document.hidden)leaveSnap(); });
+  // 每 5 分鐘墊底：有變更才存快照
+  clearInterval(_snapTimer);
+  _snapTimer=setInterval(()=>{ if(gAuth.token&&_localDirty){ cloudPush({snapshot:true}); } },5*60*1000);
 }
 
 function isAdmin(){return ADMIN_EMAIL&&gAuth.email&&gAuth.email.toLowerCase()===ADMIN_EMAIL.toLowerCase();}
@@ -499,10 +581,12 @@ function cloudMenu(){
     <div class="desc">已登入：${gAuth.email}</div>
     <div class="card" style="margin-bottom:10px;font-size:.8rem">全公司共用同一份資料，所有人看到完整的專案與排程。${isAdmin()?'你是管理者，可看到金額並管理人員。':'金額僅管理者可見。'}</div>
     <div style="display:flex;flex-direction:column;gap:8px">
-      <button class="btn" onclick="cloudPush();closeModal();toast('已手動同步到雲端')">⬆ 立即同步到雲端</button>
+      <button class="btn" onclick="cloudPush({snapshot:true});closeModal();toast('已手動同步並存快照')">⬆ 立即同步到雲端</button>
       <button class="btn sec" onclick="cloudPull();closeModal()">⬇ 從雲端重新載入</button>
+      <button class="btn sec" onclick="openSnapshots()">🕓 還原備份快照</button>
       <button class="btn sec" onclick="cloudSignOut();closeModal()">登出</button>
     </div>
+    <div style="font-size:.7rem;color:var(--muted);margin-top:8px">系統會在你變更後自動同步，並定時／離開頁面時另存帶時間的快照（保留最近 ${SNAP_KEEP} 份），萬一資料被覆蓋可從「還原備份快照」救回。</div>
     <div class="modal-actions"><button class="btn sec" onclick="closeModal()">關閉</button></div></div>`;
   M.classList.add('open');
 }
@@ -511,6 +595,55 @@ function cloudSignOut(){
   gAuth.token=null;gAuth.email=null;gAuth.fileId=null;updateCloudBtn();toast('已登出');
   try{localStorage.removeItem('pmGoogleToken');}catch(e){}
   renderDashboard();renderMembers();
+}
+
+// 列出雲端的時間戳快照，讓使用者挑一份還原
+async function openSnapshots(){
+  const M=document.getElementById('modal');
+  M.innerHTML=`<div class="modal"><h3>🕓 還原備份快照</h3><div class="desc">正在讀取快照清單…</div></div>`;
+  M.classList.add('open');
+  try{
+    if(!gAuth.token){M.querySelector('.desc').textContent='請先登入';return;}
+    let q=`name contains 'pmdata-snap-' and trashed=false`;
+    if(SHARED_FOLDER_ID)q=`'${SHARED_FOLDER_ID}' in parents and `+q;
+    const res=await gapi.client.drive.files.list({q,fields:'files(id,name,createdTime)',orderBy:'createdTime desc',pageSize:100,spaces:'drive'});
+    const files=(res.result.files||[]);
+    if(!files.length){
+      M.innerHTML=`<div class="modal"><h3>🕓 還原備份快照</h3>
+        <div class="desc">目前還沒有快照。等你開始使用、有變更後，系統會自動建立。</div>
+        <div class="modal-actions"><button class="btn sec" onclick="cloudMenu()">返回</button></div></div>`;
+      return;
+    }
+    const fmtSnap=n=>{ const m=n.match(/pmdata-snap-(\d{4})(\d{2})(\d{2})-(\d{2})(\d{2})(\d{2})/);
+      return m?`${m[1]}/${m[2]}/${m[3]} ${m[4]}:${m[5]}:${m[6]}`:n; };
+    M.innerHTML=`<div class="modal"><h3>🕓 還原備份快照</h3>
+      <div class="desc">選一個時間點還原。還原會用該快照覆蓋目前資料（會先把目前狀態也存一份快照，以防萬一）。</div>
+      <div style="max-height:46vh;overflow-y:auto;margin-top:8px">
+        ${files.map(f=>`<div style="display:flex;justify-content:space-between;align-items:center;padding:8px 4px;border-bottom:1px solid var(--border)">
+          <span style="font-size:.82rem">${fmtSnap(f.name)}</span>
+          <button class="btn sec sm" onclick="restoreSnapshot('${f.id}','${fmtSnap(f.name)}')">還原</button></div>`).join('')}
+      </div>
+      <div class="modal-actions"><button class="btn sec" onclick="cloudMenu()">返回</button></div></div>`;
+  }catch(e){
+    M.innerHTML=`<div class="modal"><h3>🕓 還原備份快照</h3><div class="desc">讀取失敗：${e&&e.message?e.message:''}</div>
+      <div class="modal-actions"><button class="btn sec" onclick="cloudMenu()">返回</button></div></div>`;
+  }
+}
+async function restoreSnapshot(fileId,label){
+  if(!confirm('確定還原到「'+label+'」？\n目前的資料會先另存一份快照，再用這個版本覆蓋。'))return;
+  try{
+    // 先把目前狀態存成快照，避免還原後想反悔
+    await cloudPush({snapshot:true});
+    const res=await gapi.client.drive.files.get({fileId,alt:'media'});
+    let data=res.result;
+    if(typeof data==='string'){try{data=JSON.parse(data);}catch(e){data=null;}}
+    if(!data||!data.members||!data.projects){toast('這個快照內容無法讀取');return;}
+    db=data; localStorage.setItem('pmBigTable',JSON.stringify(db));
+    migrate();
+    await cloudPush(); // 把還原後的版本設為目前共用檔
+    closeModal();renderDashboard();renderMembers();if(currentView())switchView(currentView());
+    toast('已還原到 '+label);
+  }catch(e){ toast('還原失敗：'+(e&&e.message?e.message:'')); }
 }
 
 function toast(msg){
@@ -2364,7 +2497,7 @@ function migrate(){
   });
   if(ch)save();
 }
-window.onload=()=>{ injectNotionCases(); migrate(); renderDashboard(); renderMembers(); initGoogle(); };
+window.onload=()=>{ injectNotionCases(); migrate(); detectBootDirty(); renderDashboard(); renderMembers(); initGoogle(); };
 </script>
 </body>
 </html>
