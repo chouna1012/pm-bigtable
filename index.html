@@ -620,6 +620,8 @@ function renderDashboard(){
           <option value="cost" ${dashSort==='cost'?'selected':''}>成本 高→低</option>`:''}
           <option value="prog" ${dashSort==='prog'?'selected':''}>進度 高→低</option>
           <option value="progAsc" ${dashSort==='progAsc'?'selected':''}>進度 低→高</option>
+          <option value="startDesc" ${dashSort==='startDesc'?'selected':''}>開案日 新→舊</option>
+          <option value="startAsc" ${dashSort==='startAsc'?'selected':''}>開案日 舊→新</option>
           <option value="due" ${dashSort==='due'?'selected':''}>期望完工日 近→遠</option>
         </select>
       </div>
@@ -642,6 +644,14 @@ function renderDashboard(){
           case 'cost': return projCost(b,'plan')-projCost(a,'plan');
           case 'prog': return projProgress(b)-projProgress(a);
           case 'progAsc': return projProgress(a)-projProgress(b);
+          case 'startDesc': {
+            const da=a.startDate||'0000', db_=b.startDate||'0000';
+            return da<db_?1:da>db_?-1:0; // 新到舊
+          }
+          case 'startAsc': {
+            const da=a.startDate||'9999', db_=b.startDate||'9999';
+            return da<db_?-1:da>db_?1:0; // 舊到新
+          }
           case 'due': {
             const da=a.dueDate||'9999', db_=b.dueDate||'9999';
             return da<db_?-1:da>db_?1:0;
@@ -778,7 +788,7 @@ function renderMembers(){
         <div style="font-weight:700"><span class="badge b-${stage}">${label}</span> <span style="color:var(--muted);font-size:.74rem">${items.length} 項</span></div>
         <button class="btn sec sm" onclick="editTemplate('${stage}')">✏ 編輯</button>
       </div>
-      <div style="font-size:.76rem;color:var(--text);line-height:1.6">${items.length?items.map((t,i)=>`${i+1}. ${t}`).join('<br>'):'<span style="color:var(--muted)">（空，按編輯新增）</span>'}</div>
+      <div style="font-size:.76rem;color:var(--text);line-height:1.6">${items.length?items.map((t,i)=>`${i+1}. ${tplItemLabel(t)}`).join('<br>'):'<span style="color:var(--muted)">（空，按編輯新增）</span>'}</div>
     </div>`;
   });
 
@@ -794,13 +804,24 @@ function renderMembers(){
 
 // 編輯某階段範本
 function stageLabel(stage){ return STAGE_LABELS[stage]||(db.customStatus&&db.customStatus[stage])||STATUS[stage]||stage; }
+// 範本項目可寫成「任務名稱」或「任務名稱 | 總工時」，例如「S02-1 平面圖定稿 | 16」
+function parseTplItem(line){
+  const parts=String(line).split('|');
+  const name=(parts[0]||'').trim();
+  let hours=0;
+  if(parts[1]!=null){ const n=parseFloat(parts[1].replace(/[^0-9.]/g,'')); if(!isNaN(n))hours=n; }
+  return {name,hours};
+}
+function tplItemLabel(line){ const {name,hours}=parseTplItem(line); return hours>0?`${name}（${hours}h）`:name; }
+
 function editTemplate(stage){
   if(!canManageMembers()){toast('只有管理者能設定');return;}
   const items=stageTasks(stage);
   const M=document.getElementById('modal');
   const isBuiltin=!!DEFAULT_TEMPLATES[stage];
   M.innerHTML=`<div class="modal"><h3>✏ 編輯範本：${stageLabel(stage)}</h3>
-    <div class="desc">一行一個任務，順序即為加入時的順序。</div>
+    <div class="desc">一行一個任務，順序即為加入時的順序。<br>
+    可選填預設總工時：<b>任務名稱 | 工時</b>，例如「平面圖定稿 | 16」表示預設 16 小時。不填工時也可以。</div>
     <textarea id="tpl-text" rows="14" style="width:100%;background:var(--surface2);border:1px solid var(--border);color:var(--text);border-radius:9px;padding:10px;font-size:.82rem;line-height:1.7;outline:none">${items.join('\n')}</textarea>
     <div class="modal-actions">
       <button class="btn sec" onclick="renderMembers();closeModal()">取消</button>
@@ -1005,7 +1026,7 @@ let schedAnchor=null;   // 起始顯示日（字串），null=自動
 let schedDays=21;       // 一次顯示幾天
 let viewMode='plan';    // 計劃/實際/對照
 let dashFilter={status:'',member:'',region:'',kw:''}; // 總覽篩選
-let dashSort='default'; // 總覽排序
+let dashSort='startDesc'; // 總覽排序：預設開案日 新→舊
 let schedStatusFilter=''; // 排程：只看某狀態的案子
 let schedMemberFilter=''; // 排程：只看某人
 function setSort(v){dashSort=v;renderDashboard();}
@@ -1954,13 +1975,16 @@ function applyTemplate(pid,wid,stage){
   const items=stageTasks(stage);
   if(!items.length){toast('此階段範本是空的，請先到人員頁設定');return;}
   let off=nextOffset(w);
-  items.forEach(name=>{
-    w.tasks.push({id:uid('t'),name,assignees:[],fixedCost:0,fixedCostName:'',fixedCostActual:null,
+  items.forEach(line=>{
+    const {name,hours}=parseTplItem(line);
+    // 若範本有預設工時，先放一筆「未指派負責人」的工時，套用後再指派人員即可
+    const assignees=hours>0?[{memberId:'',hours:hours,hoursActual:null}]:[];
+    w.tasks.push({id:uid('t'),name,assignees,fixedCost:0,fixedCostName:'',fixedCostActual:null,
       durPlan:3,durActual:0,startActualOffset:null,startOffset:off,startDate:'',pct:0,status:'todo',deps:[]});
     off+=3;
   });
   save();closeModal();renderProject(pid);
-  toast('已加入 '+STAGE_LABELS[stage]+' 範本（'+items.length+' 項）');
+  toast('已加入 '+stageLabel(stage)+' 範本（'+items.length+' 項）');
 }
 function delTask(pid,wid,tid){
   if(!confirm('刪除此任務？'))return;
