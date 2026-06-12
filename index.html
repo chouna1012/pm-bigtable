@@ -804,15 +804,23 @@ function renderMembers(){
 
 // 編輯某階段範本
 function stageLabel(stage){ return STAGE_LABELS[stage]||(db.customStatus&&db.customStatus[stage])||STATUS[stage]||stage; }
-// 範本項目可寫成「任務名稱」或「任務名稱 | 總工時」，例如「S02-1 平面圖定稿 | 16」
+// 範本項目可寫成「任務名稱」、「任務名稱 | 工時」或「任務名稱 | 工時 | 工期天數」
+// 例如「S02-1 平面圖定稿 | 16 | 3」= 預設 16 小時、工期 3 天
 function parseTplItem(line){
   const parts=String(line).split('|');
   const name=(parts[0]||'').trim();
-  let hours=0;
+  let hours=0, days=0;
   if(parts[1]!=null){ const n=parseFloat(parts[1].replace(/[^0-9.]/g,'')); if(!isNaN(n))hours=n; }
-  return {name,hours};
+  if(parts[2]!=null){ const d=parseFloat(parts[2].replace(/[^0-9.]/g,'')); if(!isNaN(d))days=d; }
+  return {name,hours,days};
 }
-function tplItemLabel(line){ const {name,hours}=parseTplItem(line); return hours>0?`${name}（${hours}h）`:name; }
+function tplItemLabel(line){ const {name,hours,days}=parseTplItem(line);
+  let suffix='';
+  if(hours>0&&days>0)suffix=`（${hours}h・${days}天）`;
+  else if(hours>0)suffix=`（${hours}h）`;
+  else if(days>0)suffix=`（${days}天）`;
+  return name+suffix;
+}
 
 function editTemplate(stage){
   if(!canManageMembers()){toast('只有管理者能設定');return;}
@@ -821,7 +829,8 @@ function editTemplate(stage){
   const isBuiltin=!!DEFAULT_TEMPLATES[stage];
   M.innerHTML=`<div class="modal"><h3>✏ 編輯範本：${stageLabel(stage)}</h3>
     <div class="desc">一行一個任務，順序即為加入時的順序。<br>
-    可選填預設總工時：<b>任務名稱 | 工時</b>，例如「平面圖定稿 | 16」表示預設 16 小時。不填工時也可以。</div>
+    可選填：<b>任務名稱 | 工時 | 工期天數</b>，例如「平面圖定稿 | 16 | 3」= 預設 16 小時、工期 3 天。<br>
+    只填工時也行（平面圖定稿 | 16），或只填名稱都可以。</div>
     <textarea id="tpl-text" rows="14" style="width:100%;background:var(--surface2);border:1px solid var(--border);color:var(--text);border-radius:9px;padding:10px;font-size:.82rem;line-height:1.7;outline:none">${items.join('\n')}</textarea>
     <div class="modal-actions">
       <button class="btn sec" onclick="renderMembers();closeModal()">取消</button>
@@ -1689,6 +1698,9 @@ function renderProject(id){
     allT.forEach(t=>{ const sd=taskDate(t); if(sd){ if(sd<gridStart)gridStart=sd; const ed=addDays(sd,Math.max(1,t.durPlan||1)-1); if(ed>gridEnd)gridEnd=ed; } });
     if(todayStr<gridStart)gridStart=todayStr;
     if(todayStr>gridEnd)gridEnd=todayStr;
+    // 今天前面保留幾天可往左拉；今天後面也多留一些空間
+    const back=addDays(todayStr,-7); if(back<gridStart)gridStart=back;
+    const fwd=addDays(todayStr,14); if(fwd>gridEnd)gridEnd=fwd;
     const span=Math.max(1,daysBetween(gridStart,gridEnd)+1);
     for(let i=0;i<span;i++)ganttDates.push(addDays(gridStart,i));
   }
@@ -1803,7 +1815,7 @@ function renderProject(id){
   });
   html+=`</tbody></table></div>`;
   if(mode==='both')html+=`<div style="font-size:.7rem;color:var(--muted);margin-top:8px">時間軸：藍/紫＝計劃工期，綠＝實際；灰底＝週末、紅底＝假日、紅框＝今天。對照模式上排＝計劃、下排＝實際。</div>`;
-  else html+=`<div style="font-size:.7rem;color:var(--muted);margin-top:8px">時間軸格子：每格一天，灰底＝週末、紅底＝假日、紅框＝今天。開啟自動捲到今天。</div>`;
+  else html+=`<div style="font-size:.7rem;color:var(--muted);margin-top:8px">時間軸格子：每格一天，灰底＝週末、紅底＝假日、紅框＝今天。一進來今天在最前面，可往左拉看過去、往右拉看未來。</div>`;
 
   // RESOURCE HISTOGRAM
   html+=`<div class="section-head"><h2>👥 資源用量分配（${modeLabel}）</h2></div><div class="bigtable-wrap" style="padding:16px">`;
@@ -1867,13 +1879,14 @@ function renderProject(id){
 
   el.innerHTML=html;
   el.dataset.pid=id;
-  // 任務大表自動捲到「今天」（扣掉凍結欄寬度，今天才不會被蓋住）
+  // 任務大表自動捲到「今天」：讓今天成為時間軸第一欄（仍可往左拉看過去）
   const _fzw=fzTotal;
   setTimeout(()=>{
     const wrap=document.getElementById('taskTableWrap');
     const tk=document.getElementById('ganttToday');
     if(wrap&&tk){
-      const left=tk.offsetLeft-_fzw-wrap.clientWidth*0.3;
+      // 今天那欄剛好貼齊凍結區右側，成為可視時間軸的第一欄
+      const left=tk.offsetLeft-_fzw-4;
       wrap.scrollLeft=Math.max(0,left);
     }
   },200);
@@ -1976,12 +1989,12 @@ function applyTemplate(pid,wid,stage){
   if(!items.length){toast('此階段範本是空的，請先到人員頁設定');return;}
   let off=nextOffset(w);
   items.forEach(line=>{
-    const {name,hours}=parseTplItem(line);
-    // 若範本有預設工時，先放一筆「未指派負責人」的工時，套用後再指派人員即可
+    const {name,hours,days}=parseTplItem(line);
+    const dur=days>0?days:3; // 範本有設工期就用，否則預設 3 天
     const assignees=hours>0?[{memberId:'',hours:hours,hoursActual:null}]:[];
     w.tasks.push({id:uid('t'),name,assignees,fixedCost:0,fixedCostName:'',fixedCostActual:null,
-      durPlan:3,durActual:0,startActualOffset:null,startOffset:off,startDate:'',pct:0,status:'todo',deps:[]});
-    off+=3;
+      durPlan:dur,durActual:0,startActualOffset:null,startOffset:off,startDate:'',pct:0,status:'todo',deps:[]});
+    off+=dur;
   });
   save();closeModal();renderProject(pid);
   toast('已加入 '+stageLabel(stage)+' 範本（'+items.length+' 項）');
