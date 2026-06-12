@@ -1776,15 +1776,19 @@ function renderProject(id){
       const delCell=taskEditMode?`<td><button class="btn danger sm" onclick="event.stopPropagation();delTask('${p.id}','${wp.id}','${t.id}')">✕</button></td>`:'<td></td>';
       // 時間軸日期格子（同一列，接在狀態後面）
       const sd=taskDate(t); const dur=Math.max(1,t.durPlan||1);
-      const startIdx=(rulerStart&&sd)?daysBetween(ganttDates[0],sd):-1;
-      const aDur=t.durActual||0; const aStartIdx=startIdx;
       const planColor=locked?'var(--accent2)':'var(--accent)';
+      // 計劃工期攤在「工作日」上，跳過週末與假日（與排程一致）
+      const planSet=sd?new Set(workdaysFrom(sd,dur)):new Set();
+      // 實際工期：用實際起始日（沒填就沿用計劃起始日）往後攤工作日
+      const aDur=t.durActual||0;
+      const aStart=sd; // 目前實際起始沿用計劃起始日
+      const actSet=(aStart&&aDur>0)?new Set(workdaysFrom(aStart,aDur)):new Set();
       let dayCells='';
       ganttDates.forEach((d,i)=>{
         const we=isWeekend(d), hol=isHoliday(d), isToday=d===todayStr;
         let bg=hol?'#3a2030':(we?'#23283d':'transparent');
-        const inPlan=mode!=='actual'&&startIdx>=0&&i>=startIdx&&i<startIdx+dur;
-        const inAct=mode!=='plan'&&aDur>0&&aStartIdx>=0&&i>=aStartIdx&&i<aStartIdx+aDur;
+        const inPlan=mode!=='actual'&&planSet.has(d);
+        const inAct=mode!=='plan'&&actSet.has(d);
         if(mode==='both'){
           dayCells+=`<td class="gantt-cell" style="background:${bg};padding:2px!important;${isToday?'box-shadow:inset 0 0 0 1px color-mix(in srgb,var(--red) 50%,transparent);':''}" onclick="editTask('${p.id}','${wp.id}','${t.id}')">
             <div style="height:7px;border-radius:2px;background:${inPlan?planColor:'transparent'}"></div>
